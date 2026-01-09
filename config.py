@@ -1,0 +1,3 @@
+POSTGRES_URL = "postgresql+psycopg2://postgres:neeraj@localhost:5433/ms_rag_db"
+
+OPENAI_API_KEY = "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"
