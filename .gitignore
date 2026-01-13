@@ -3,3 +3,5 @@ __pycache__/
 rag-env/
 .env
 api_keys/
+config.py
+.llm_cache/

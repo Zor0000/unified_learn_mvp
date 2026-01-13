@@ -8,25 +8,24 @@ from langchain_openai import ChatOpenAI, OpenAIEmbeddings
 from langchain_community.vectorstores.pgvector import PGVector
 from langchain_core.prompts import ChatPromptTemplate
 from config import POSTGRES_URL
-from langchain_core.prompts import ChatPromptTemplate
 
-# ---------------- PROMPT TEMPLATES ----------------
+# ======================================================
+# PROMPTS 
+# ======================================================
 
 HOW_PROMPT = ChatPromptTemplate.from_template(
     """
-You are a helpful technical assistant.
+You are an expert Copilot Studio assistant.
 
-Answer the question using ONLY the context below.
-Do NOT add information that is not present in the context.
+Using ONLY the context below, answer the question in a clear,
+user-friendly way.
 
-The question is asking for steps.
-
-Instructions:
-- Combine relevant instructions from the context
-- Present the answer as a clear, ordered step-by-step list
-- Avoid repeating the same step
-- Limit the main steps to at most 5 items
-- Add optional steps only if necessary
+Guidelines:
+- Start with a short explanation of what the process is
+- Then provide step-by-step instructions
+- Use clear numbering
+- Explain *why* a step is needed if helpful
+- Do NOT invent steps not present in the context
 
 Context:
 {context}
@@ -38,14 +37,13 @@ Question:
 
 WHAT_PROMPT = ChatPromptTemplate.from_template(
     """
-You are a helpful technical assistant.
+You are an expert Copilot Studio assistant.
 
-Answer the question using ONLY the context below.
-
-Instructions:
-- Provide a clear, concise definition
-- Explain the purpose and key idea
-- Do not provide steps unless explicitly asked
+Using ONLY the context below:
+- Clearly define the concept
+- Explain its purpose
+- Mention key components or ideas
+- Keep it easy to understand
 
 Context:
 {context}
@@ -57,14 +55,12 @@ Question:
 
 WHY_PROMPT = ChatPromptTemplate.from_template(
     """
-You are a helpful technical assistant.
+You are an expert Copilot Studio assistant.
 
-Answer the question using ONLY the context below.
-
-Instructions:
-- Explain the reasoning or benefits clearly
-- Focus on concepts, not procedures
-- Keep the explanation structured but concise
+Using ONLY the context below:
+- Explain the reasoning, benefits, or motivation
+- Structure the explanation logically
+- Keep it concise but insightful
 
 Context:
 {context}
@@ -76,10 +72,13 @@ Question:
 
 DEFAULT_PROMPT = ChatPromptTemplate.from_template(
     """
-You are a helpful assistant.
+You are a helpful Copilot Studio assistant.
 
 Answer the question using ONLY the context below.
-If the answer is not in the context, say "I don't know".
+If the answer is not clearly present, say:
+"I don’t have enough information in the provided context."
+
+Explain things clearly and naturally, like ChatGPT would.
 
 Context:
 {context}
@@ -89,119 +88,136 @@ Question:
 """
 )
 
-# --------------------------------------------------
+# ======================================================
+# SIMPLE INTENT DETECTION
+# ======================================================
+
 def detect_question_type(question: str) -> str:
     q = question.lower().strip()
 
-    if q.startswith(("how", "steps", "procedure")):
+    if q.startswith(("how", "steps", "procedure", "process")):
         return "how"
-    elif q.startswith(("what", "define")):
+    elif q.startswith(("what", "define", "meaning")):
         return "what"
-    elif q.startswith(("why", "benefit", "reason")):
+    elif q.startswith(("why", "benefit", "reason", "advantage")):
         return "why"
     else:
         return "default"
 
 
-COLLECTION_NAME = "copilot_pdf_agentic"
+# ======================================================
+# LIGHTWEIGHT TOPIC ROUTING (VERY IMPORTANT)
+# ======================================================
+
+def detect_topic(question: str) -> str | None:
+    q = question.lower()
+
+    if "orchestration" in q:
+        return "agent_orchestration"
+    if "deploy" in q or "publish" in q:
+        return "deployment_and_publishing"
+    if "connect" in q or "api" in q:
+        return "external_apis"
+    if "security" in q or "auth" in q:
+        return "authentication_and_security"
+    if "monitor" in q or "analytics" in q:
+        return "monitoring_and_analytics"
+
+    return None  # fallback = no topic filter
+
+
+# ======================================================
+# CONFIG
+# ======================================================
+
+COLLECTION_NAME = "copilot_chunks_v2_fast_h2"
 
 
 def start_chat():
-    # Embeddings (must match ingestion)
     embeddings = OpenAIEmbeddings()
 
-    # Vector store
     vectorstore = PGVector(
         connection_string=POSTGRES_URL,
         embedding_function=embeddings,
         collection_name=COLLECTION_NAME
     )
 
-    # LLM
     llm = ChatOpenAI(
         model="gpt-4o-mini",
-        temperature=0.5
+        temperature=0.4
     )
 
-    print("\n🧠 RAG Chat Ready (type 'exit' to quit)\n")
+    print("\n🧠 Copilot Studio RAG Chat Ready (type 'exit' to quit)\n")
 
     while True:
-        question = input("You: ")
+        question = input("You: ").strip()
         if question.lower() == "exit":
             break
 
-        # -------------------------------
-        # 1. Detect question type
-        # -------------------------------
         question_type = detect_question_type(question)
+        topic = detect_topic(question)
 
         # -------------------------------
-        # 2. Choose retriever strategy
+        # Choose retriever
         # -------------------------------
+        search_kwargs = {"k": 6}
+
+        if topic:
+            search_kwargs["filter"] = {
+                "primary_topic": topic
+            }
+
+        retriever = vectorstore.as_retriever(
+            search_kwargs=search_kwargs
+        )
+
         if question_type == "how":
-            retriever = vectorstore.as_retriever(
-                search_kwargs={"k": 10}
-            )
             prompt = HOW_PROMPT
         elif question_type == "what":
-            retriever = vectorstore.as_retriever(
-                search_kwargs={"k": 5}
-            )
             prompt = WHAT_PROMPT
         elif question_type == "why":
-            retriever = vectorstore.as_retriever(
-                search_kwargs={"k": 5}
-            )
             prompt = WHY_PROMPT
         else:
-            retriever = vectorstore.as_retriever(
-                search_kwargs={"k": 5}
-            )
             prompt = DEFAULT_PROMPT
 
         # -------------------------------
-        # 3. Retrieve documents
+        # Retrieve documents
         # -------------------------------
         docs = retriever.invoke(question)
 
-        # Ensure procedural order (important for steps)
+        if not docs:
+            print("\n🤖 Answer:\n")
+            print("I don’t have enough information in the knowledge base to answer this.")
+            print("\n" + "-" * 50 + "\n")
+            continue
+
+        # Order chunks logically if available
         docs = sorted(docs, key=lambda d: d.metadata.get("page_number", 0))
 
         # -------------------------------
-        # 4. DEBUG: Inspect retrieved chunks
+        # Build structured context
         # -------------------------------
-        print("\n--- Retrieved Chunks ---")
-        for d in docs:
-            print(
-                f"Page {d.metadata.get('page_number')} | "
-                f"Tag: {d.metadata.get('tag')} | "
-                f"Type: {d.metadata.get('chunk_type')}"
+        context_parts = []
+        for i, d in enumerate(docs, start=1):
+            context_parts.append(
+                f"[Source {i}]\n{d.page_content}"
             )
-            print(d.page_content[:200])
-            print("------------------------")
+
+        context = "\n\n".join(context_parts)
 
         # -------------------------------
-        # 5. Build context
-        # -------------------------------
-        context = "\n\n".join(doc.page_content for doc in docs)
-
-        # -------------------------------
-        # 6. Format prompt
+        # Prompt → LLM
         # -------------------------------
         messages = prompt.format_messages(
             context=context,
             question=question
         )
 
-        # -------------------------------
-        # 7. Call LLM
-        # -------------------------------
         response = llm.invoke(messages)
 
         print("\n🤖 Answer:\n")
-        print(response.content)
+        print(response.content.strip())
         print("\n" + "-" * 50 + "\n")
-
 
 
 if __name__ == "__main__":
