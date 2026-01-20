@@ -1,16 +1,16 @@
 import sys
 import os
+import time
 
 # Add project root to path
 sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores.pgvector import PGVector
+from langchain_milvus import Milvus
 from langchain_core.prompts import ChatPromptTemplate
-from config import POSTGRES_URL
 
 # ======================================================
-# PROMPTS 
+# PROMPTS
 # ======================================================
 
 HOW_PROMPT = ChatPromptTemplate.from_template(
@@ -78,7 +78,7 @@ Answer the question using ONLY the context below.
 If the answer is not clearly present, say:
 "I don’t have enough information in the provided context."
 
-Explain things clearly and naturally, like ChatGPT would.
+Explain things clearly and naturally.
 
 Context:
 {context}
@@ -104,9 +104,8 @@ def detect_question_type(question: str) -> str:
     else:
         return "default"
 
-
 # ======================================================
-# LIGHTWEIGHT TOPIC ROUTING (VERY IMPORTANT)
+# LIGHTWEIGHT TOPIC ROUTING
 # ======================================================
 
 def detect_topic(question: str) -> str | None:
@@ -123,23 +122,24 @@ def detect_topic(question: str) -> str | None:
     if "monitor" in q or "analytics" in q:
         return "monitoring_and_analytics"
 
-    return None  # fallback = no topic filter
-
+    return None
 
 # ======================================================
 # CONFIG
 # ======================================================
 
-COLLECTION_NAME = "copilot_chunks_v2_fast_h2"
-
+COLLECTION_NAME = "rag_chunks"
 
 def start_chat():
     embeddings = OpenAIEmbeddings()
 
-    vectorstore = PGVector(
-        connection_string=POSTGRES_URL,
+    vectorstore = Milvus(
         embedding_function=embeddings,
-        collection_name=COLLECTION_NAME
+        collection_name=COLLECTION_NAME,
+        connection_args={
+            "host": "localhost",
+            "port": "19530"
+        }
     )
 
     llm = ChatOpenAI(
@@ -147,25 +147,22 @@ def start_chat():
         temperature=0.4
     )
 
-    print("\n🧠 Copilot Studio RAG Chat Ready (type 'exit' to quit)\n")
+    print("\n🧠 Copilot Studio RAG Chat (Milvus) — type 'exit' to quit\n")
 
     while True:
         question = input("You: ").strip()
         if question.lower() == "exit":
             break
 
+        total_start = time.time()  # ⏱️ TOTAL TIMER
+
         question_type = detect_question_type(question)
         topic = detect_topic(question)
 
-        # -------------------------------
-        # Choose retriever
-        # -------------------------------
         search_kwargs = {"k": 6}
 
         if topic:
-            search_kwargs["filter"] = {
-                "primary_topic": topic
-            }
+            search_kwargs["expr"] = f'primary_topic == "{topic}"'
 
         retriever = vectorstore.as_retriever(
             search_kwargs=search_kwargs
@@ -181,44 +178,49 @@ def start_chat():
             prompt = DEFAULT_PROMPT
 
         # -------------------------------
-        # Retrieve documents
+        # ⏱️ RETRIEVAL LATENCY
         # -------------------------------
+        retrieval_start = time.time()
         docs = retriever.invoke(question)
+        retrieval_latency = time.time() - retrieval_start
 
         if not docs:
             print("\n🤖 Answer:\n")
             print("I don’t have enough information in the knowledge base to answer this.")
+            print(f"\n⏱️ Retrieval latency: {retrieval_latency:.2f}s")
             print("\n" + "-" * 50 + "\n")
             continue
 
-        # Order chunks logically if available
-        docs = sorted(docs, key=lambda d: d.metadata.get("page_number", 0))
-
-        # -------------------------------
-        # Build structured context
-        # -------------------------------
         context_parts = []
         for i, d in enumerate(docs, start=1):
-            context_parts.append(
-                f"[Source {i}]\n{d.page_content}"
-            )
+            context_parts.append(f"[Source {i}]\n{d.page_content}")
 
         context = "\n\n".join(context_parts)
 
-        # -------------------------------
-        # Prompt → LLM
-        # -------------------------------
         messages = prompt.format_messages(
             context=context,
             question=question
         )
 
+        # -------------------------------
+        # ⏱️ LLM LATENCY
+        # -------------------------------
+        llm_start = time.time()
         response = llm.invoke(messages)
+        llm_latency = time.time() - llm_start
+
+        total_latency = time.time() - total_start
 
         print("\n🤖 Answer:\n")
         print(response.content.strip())
-        print("\n" + "-" * 50 + "\n")
 
+        print(
+            f"\n⏱️ Retrieval latency: {retrieval_latency:.2f}s"
+            f"\n⏱️ LLM latency: {llm_latency:.2f}s"
+            f"\n⏱️ Total latency: {total_latency:.2f}s"
+        )
+
+        print("\n" + "-" * 50 + "\n")
 
 if __name__ == "__main__":
     start_chat()

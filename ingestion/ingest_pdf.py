@@ -1,4 +1,4 @@
-# FAST Copilot Studio PDF Ingestion (H2-based + Batched + Cached)
+# FAST Copilot Studio PDF Ingestion (Milvus-based + Batched + Cached)
 
 import os
 import sys
@@ -16,33 +16,28 @@ import fitz  # PyMuPDF
 
 # ---------- LangChain ----------
 from langchain_openai import ChatOpenAI, OpenAIEmbeddings
-from langchain_community.vectorstores.pgvector import PGVector
+from langchain_milvus import Milvus
 from langchain_core.documents import Document
 from langchain_core.messages import HumanMessage
 
 # ---------- Pydantic ----------
 from pydantic import BaseModel, Field
 
-# ---------- Config ----------
-from config import POSTGRES_URL
-
-
 # ============================================================
 # CONFIG
 # ============================================================
 
 PDF_PATH = r"D:\RAG_Agent_Internship\data\copilot_studio.pdf"
-NEW_COLLECTION = "copilot_chunks_v2_fast_h2"
+COLLECTION_NAME = "rag_chunks"
 
-MAX_WORKERS = 4          # parallel LLM calls
-H2_BATCH_SIZE = 3        # H2 sections per LLM call
+MAX_WORKERS = 4
+H2_BATCH_SIZE = 3
 
 CACHE_DIR = Path(".llm_cache")
 CACHE_DIR.mkdir(exist_ok=True)
 
-
 # ============================================================
-# CONTROLLED TOPIC TAXONOMY (NO LLM CREATION)
+# CONTROLLED TOPIC TAXONOMY
 # ============================================================
 
 COPILOT_TOPICS = [
@@ -50,22 +45,17 @@ COPILOT_TOPICS = [
     "agent_architecture",
     "agent_orchestration",
     "generative_ai_flows",
-
     "agent_authoring",
     "conversation_design",
     "prompt_engineering",
-
     "connectors_and_plugins",
     "external_apis",
     "data_sources",
-
     "authentication_and_security",
     "environment_management",
     "deployment_and_publishing",
-
     "testing_and_debugging",
     "monitoring_and_analytics",
-
     "governance_and_compliance",
     "limits_and_quotas",
     "support_and_community",
@@ -74,33 +64,24 @@ COPILOT_TOPICS = [
     "content_moderation",
 ]
 
+# ============================================================
+# H2 DETECTION
+# ============================================================
+
 def is_h2(text: str, font_size: float) -> bool:
-    # Font size threshold (still required)
     if font_size < 15:
         return False
-
-    # Too long → probably paragraph text
     if len(text) > 120:
         return False
-
-    # Headings usually don't end with punctuation
     if text.endswith((".", ":", ";", ",")):
         return False
-
-    # Exclude numbered steps like "1. Do this"
     if text[0].isdigit():
         return False
-
-    # Exclude bullet points
     if text.startswith(("•", "-", "*")):
         return False
-
-    # Exclude very short noise (e.g. UI labels)
     if len(text.split()) < 3:
         return False
-
     return True
-
 
 # ============================================================
 # Pydantic Schemas
@@ -110,22 +91,16 @@ class AgenticChunk(BaseModel):
     chunk_title: str
     chunk_text: str
     chunk_summary: str
-
     chunk_type: str = Field(description="concept | how_to | reference")
-
     primary_topic: str
-    secondary_topics: List[str]
-
     keywords: List[str]
     difficulty: str = Field(description="beginner | intermediate | advanced")
-
 
 class AgenticChunkList(BaseModel):
     chunks: List[AgenticChunk]
 
-
 # ============================================================
-# PROMPT (LLM ONLY MAPS TO ALLOWED TOPICS)
+# PROMPT
 # ============================================================
 
 AGENTIC_CHUNK_PROMPT = f"""
@@ -135,17 +110,11 @@ based on Microsoft Copilot Studio documentation.
 CRITICAL RULES:
 - You MUST select topics ONLY from the list below
 - DO NOT invent, rename, or generalize topics
-- Topics must reflect how users would ask questions
+- Select exactly ONE primary_topic
+- If a concept does not clearly match an allowed topic,choose the closest applicable one.NEVER invent new topic names.
 
 Allowed topics:
 {COPILOT_TOPICS}
-
-Instructions:
-- Split text into semantically meaningful chunks
-- One Copilot Studio concept per chunk
-- Do NOT split steps or explanations mid-way
-- Select exactly ONE primary_topic
-- Select 0–3 secondary_topics
 
 Return JSON under key "chunks".
 
@@ -155,53 +124,19 @@ Text:
 >>>
 """
 
-
 # ============================================================
 # VALIDATION
 # ============================================================
-TOPIC_ALIASES = {
-    "entities": "data_sources",
-    "entities": "data_sources",
-    "speech synthesis": "generative_ai_flows",
 
-}
-
-def validate_topics(chunk: AgenticChunk):
-    # ---- PRIMARY TOPIC (STRICT) ----
-    if chunk.primary_topic in TOPIC_ALIASES:
-        chunk.primary_topic = TOPIC_ALIASES[chunk.primary_topic]
-
-    if chunk.primary_topic not in COPILOT_TOPICS:
-        raise ValueError(f"Invalid primary_topic: {chunk.primary_topic}")
-
-    # ---- SECONDARY TOPICS (LENIENT) ----
-    cleaned_secondary = []
-
-    for t in chunk.secondary_topics:
-        # normalize aliases
-        if t in TOPIC_ALIASES:
-            t = TOPIC_ALIASES[t]
-
-        # keep only known topics, DROP the rest
-        if t in COPILOT_TOPICS:
-            cleaned_secondary.append(t)
-        else:
-            # optional: log once if you want
-            # print("Dropping secondary topic:", t)
-            pass
-
-    chunk.secondary_topics = cleaned_secondary
-
-
-
+def validate_topic(topic: str):
+    if topic not in COPILOT_TOPICS:
+        raise ValueError(f"Invalid primary_topic: {topic}")
 
 # ============================================================
 # PDF → H2 SECTION EXTRACTION
 # ============================================================
 
 def extract_h2_sections(pdf_path: str):
-    import fitz  # PyMuPDF
-
     doc = fitz.open(pdf_path)
     sections = []
     current = None
@@ -238,8 +173,6 @@ def extract_h2_sections(pdf_path: str):
 
     return sections
 
-
-
 # ============================================================
 # BATCHING
 # ============================================================
@@ -254,7 +187,6 @@ def batch_sections(sections, batch_size):
     if current:
         batches.append(current)
     return batches
-
 
 # ============================================================
 # CACHE
@@ -272,7 +204,6 @@ def load_cache(text: str):
 def save_cache(text: str, data):
     path = CACHE_DIR / cache_key(text)
     path.write_text(json.dumps(data, indent=2))
-
 
 # ============================================================
 # LLM PROCESSING
@@ -295,7 +226,6 @@ def process_batch(batch, llm):
     save_cache(combined_text, data)
     return data
 
-
 # ============================================================
 # MAIN INGESTION PIPELINE
 # ============================================================
@@ -303,7 +233,6 @@ def process_batch(batch, llm):
 def ingest_pdf_fast():
     print("📄 Extracting H2 sections...")
     sections = extract_h2_sections(PDF_PATH)
-
     print(f"✔ Found {len(sections)} H2 sections")
 
     batches = batch_sections(sections, H2_BATCH_SIZE)
@@ -323,8 +252,16 @@ def ingest_pdf_fast():
         for f in as_completed(futures):
             data = f.result()
             for c in data["chunks"]:
-                chunk = AgenticChunk(**c)
-                validate_topics(chunk)
+                try:
+                    chunk = AgenticChunk(**c)
+
+                    # 🔒 STRICT but safe: drop invalid-topic chunks
+                    validate_topic(chunk.primary_topic)
+
+                except ValueError as e:
+                # Optional: uncomment to see what was dropped
+                # print(f"Dropping chunk due to topic error: {e}")
+                    continue
 
                 all_docs.append(
                     Document(
@@ -333,7 +270,6 @@ def ingest_pdf_fast():
                             "title": chunk.chunk_title,
                             "summary": chunk.chunk_summary,
                             "primary_topic": chunk.primary_topic,
-                            "secondary_topics": chunk.secondary_topics,
                             "chunk_type": chunk.chunk_type,
                             "keywords": chunk.keywords,
                             "difficulty": chunk.difficulty,
@@ -342,21 +278,46 @@ def ingest_pdf_fast():
                     )
                 )
 
+
     print(f"📦 Total chunks created: {len(all_docs)}")
 
-    print("🔢 Embedding and storing in PGVector...")
-    db = PGVector(
-        connection_string=POSTGRES_URL,
+    # ========================================================
+    # MILVUS INGESTION
+    # ========================================================
+
+    print("🔢 Embedding and storing in Milvus...")
+
+
+
+    vectorstore = Milvus(
         embedding_function=OpenAIEmbeddings(),
-        collection_name=NEW_COLLECTION
+        collection_name="rag_chunks",
+        connection_args={
+            "host": "localhost",
+            "port": "19530"
+        }
     )
 
-    db.add_documents(all_docs)
 
-    print("✅ FAST INGESTION COMPLETE")
-    print(f"📚 Collection: {NEW_COLLECTION}")
-    print("🛡️ Old embeddings untouched")
 
+    texts = []
+    metadatas = []
+
+    for i, doc in enumerate(all_docs):
+        texts.append(doc.page_content)
+        metadatas.append({
+            "source": doc.metadata["source"],
+            "chunk_id": i,
+            "primary_topic": doc.metadata["primary_topic"]
+        })
+
+    vectorstore.add_texts(
+        texts=texts,
+        metadatas=metadatas
+    )
+
+    print("✅ FAST INGESTION COMPLETE (Milvus)")
+    print(f"📚 Collection: {COLLECTION_NAME}")
 
 # ============================================================
 # ENTRY POINT
